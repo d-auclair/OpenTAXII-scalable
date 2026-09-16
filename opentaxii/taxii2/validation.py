@@ -4,6 +4,7 @@ import datetime
 import json
 from typing import Mapping, Union
 
+import structlog
 from marshmallow import Schema, fields
 from stix2 import parse
 from stix2.exceptions import STIXError
@@ -11,6 +12,8 @@ from stix2.exceptions import STIXError
 from opentaxii.persistence.api import OpenTAXII2PersistenceAPI
 from opentaxii.taxii2.exceptions import ValidationError
 from opentaxii.taxii2.utils import DATETIMEFORMAT
+
+log = structlog.get_logger(__name__)
 
 
 def validate_envelope(json_data: Union[str, bytes], allow_custom: bool = False) -> None:
@@ -28,10 +31,23 @@ def validate_envelope(json_data: Union[str, bytes], allow_custom: bool = False) 
         raise ValidationError(f"Invalid json: {str(e)}") from e
     if "objects" not in data:
         raise ValidationError("No objects")
-    for item in data["objects"]:
+    for index, item in enumerate(data["objects"]):
+        log.debug(
+            "taxii2.envelope.object.validate",
+            index=index,
+            stix_id=item.get("id"),
+            stix_type=item.get("type"),
+        )
         try:
             parse(item, allow_custom)
         except STIXError as e:
+            log.error(
+                "taxii2.envelope.object.invalid",
+                index=index,
+                stix_id=item.get("id"),
+                stix_type=item.get("type"),
+                error=str(e),
+            )
             raise ValidationError(
                 f"Invalid stix object: {json.dumps(item)}; {str(e)}"
             ) from e

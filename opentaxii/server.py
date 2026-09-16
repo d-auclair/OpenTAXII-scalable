@@ -756,14 +756,43 @@ class TAXII2Server(BaseTAXIIServer):
         )
 
     def objects_post_handler(self, api_root_id: uuid.UUID, collection_id_or_alias: str):
-        validate_envelope(
-            request.data, allow_custom=self.config.get("allow_custom_properties", True)
+        log.debug(
+            "taxii2.objects.post.request",
+            path=request.path,
+            api_root_id=str(api_root_id),
+            collection_id_or_alias=collection_id_or_alias,
+            content_length=request.content_length,
         )
+        try:
+            parsed_data = request.get_json()
+            object_count = (
+                len(parsed_data.get("objects", [])) if isinstance(parsed_data, dict) else 0
+            )
+            log.debug(
+                "taxii2.objects.post.payload",
+                path=request.path,
+                api_root_id=str(api_root_id),
+                collection_id_or_alias=collection_id_or_alias,
+                object_count=object_count,
+            )
+            validate_envelope(
+                request.data,
+                allow_custom=self.config.get("allow_custom_properties", True),
+            )
+        except Exception as error:
+            log.exception(
+                "taxii2.objects.post.validation_failed",
+                path=request.path,
+                api_root_id=str(api_root_id),
+                collection_id_or_alias=collection_id_or_alias,
+                error=str(error),
+            )
+            raise
         try:
             job = self.persistence.add_objects(
                 api_root_id=api_root_id,
                 collection_id_or_alias=collection_id_or_alias,
-                data=request.get_json(),
+                data=parsed_data,
             )
         except (DoesNotExistError, NoWritePermission):
             if context.account is None:
@@ -996,7 +1025,12 @@ class TAXIIServer:
         if not endpoint:
             raise NotFound()
         context.taxiiserver = endpoint.server
-        return endpoint()
+        try:
+            return endpoint()
+        finally:
+            for server in self.real_servers:
+                server.persistence.api.db.session.remove()
+            self.auth.api.db.session.remove()
 
     def handle_internal_error(self, error):
         """Dispatch internal error handling to appropriate taxii* server."""

@@ -26,6 +26,7 @@ taxii1:
       create_tables: yes
 
 taxii2:
+  only_keep_latest_version: false
   persistence_api:
     class: opentaxii.persistence.sqldb.Taxii2SQLDatabaseAPI
     parameters:

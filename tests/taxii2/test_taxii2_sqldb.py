@@ -949,6 +949,52 @@ def test_add_objects(
         assert db_job_detail.status == "success"
 
 
+def test_add_objects_only_keep_latest_version(taxii2_sqldb_api: Taxii2SQLDatabaseAPI):
+    taxii2_sqldb_api.only_keep_latest_version = True
+    object_id = "indicator--11111111-1111-4111-8111-111111111111"
+    older_object = {
+        "type": "indicator",
+        "spec_version": "2.1",
+        "id": object_id,
+        "pattern": "[ipv4-addr:value = '203.0.113.1']",
+        "pattern_type": "stix",
+        "created": "2024-01-01T00:00:00.000Z",
+        "modified": "2024-01-01T00:00:00.000Z",
+    }
+    newer_object = {
+        "type": "indicator",
+        "spec_version": "2.1",
+        "id": object_id,
+        "pattern": "[ipv4-addr:value = '203.0.113.2']",
+        "pattern_type": "stix",
+        "created": "2024-01-01T00:00:00.000Z",
+        "modified": "2024-01-02T00:00:00.000Z",
+    }
+
+    taxii2_sqldb_api.add_objects(
+        api_root_id=API_ROOTS[0].id,
+        collection_id=COLLECTIONS[5].id,
+        objects=[older_object],
+    )
+    taxii2_sqldb_api.add_objects(
+        api_root_id=API_ROOTS[0].id,
+        collection_id=COLLECTIONS[5].id,
+        objects=[newer_object],
+    )
+
+    db_objects = (
+        taxii2_sqldb_api.db.session.query(STIXObject)
+        .filter(
+            STIXObject.collection_id == COLLECTIONS[5].id,
+            STIXObject.id == object_id,
+        )
+        .all()
+    )
+    assert len(db_objects) == 1
+    assert db_objects[0].version == get_object_version(newer_object)
+    assert db_objects[0].serialized_data["pattern"] == newer_object["pattern"]
+
+
 @pytest.mark.parametrize(
     [
         "collection_id",

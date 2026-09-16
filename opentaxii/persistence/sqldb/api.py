@@ -57,16 +57,27 @@ class SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXIIPersistenceAPI):
 
     BASEMODEL = Base
 
+    def _read(self, callback):
+        try:
+            return callback()
+        finally:
+            self.db.session.remove()
+
     def get_services(self, collection_id=None):
-        if collection_id:
-            collection = self.db.session.query(DataCollection).get(collection_id)
-            services = collection.services
-        else:
-            services = self.db.session.query(Service).all()
-        return [conv.to_service_entity(s) for s in services]
+        def _callback():
+            if collection_id:
+                collection = self.db.session.query(DataCollection).get(collection_id)
+                services = collection.services
+            else:
+                services = self.db.session.query(Service).all()
+            return [conv.to_service_entity(s) for s in services]
+
+        return self._read(_callback)
 
     def get_service(self, service_id):
-        return conv.to_service_entity(self.db.session.query(Service).get(service_id))
+        return self._read(
+            lambda: conv.to_service_entity(self.db.session.query(Service).get(service_id))
+        )
 
     def update_service(self, obj):
         service = self.db.session.query(Service).get(obj.id) if obj.id else None
@@ -85,30 +96,36 @@ class SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXIIPersistenceAPI):
         return self.update_service(entity)
 
     def get_collections(self, service_id=None):
-        if service_id:
-            service = self.db.session.query(Service).get(service_id)
-            collections = service.collections
-        else:
-            collections = self.db.session.query(DataCollection).all()
-        return [conv.to_collection_entity(c) for c in collections]
+        def _callback():
+            if service_id:
+                service = self.db.session.query(Service).get(service_id)
+                collections = service.collections
+            else:
+                collections = self.db.session.query(DataCollection).all()
+            return [conv.to_collection_entity(c) for c in collections]
+
+        return self._read(_callback)
 
     def get_collection(self, name, service_id=None):
-        if service_id:
-            collection = (
-                self.db.session.query(DataCollection)
-                .join(Service.collections)
-                .filter(Service.id == service_id)
-                .filter(DataCollection.name == name)
-                .one_or_none()
-            )
-        else:
-            collection = (
-                self.db.session.query(DataCollection)
-                .filter(DataCollection.name == name)
-                .one_or_none()
-            )
-        if collection:
-            return conv.to_collection_entity(collection)
+        def _callback():
+            if service_id:
+                collection = (
+                    self.db.session.query(DataCollection)
+                    .join(Service.collections)
+                    .filter(Service.id == service_id)
+                    .filter(DataCollection.name == name)
+                    .one_or_none()
+                )
+            else:
+                collection = (
+                    self.db.session.query(DataCollection)
+                    .filter(DataCollection.name == name)
+                    .one_or_none()
+                )
+            if collection:
+                return conv.to_collection_entity(collection)
+
+        return self._read(_callback)
 
     def update_collection(self, entity):
         _bindings = conv.serialize_content_bindings(entity.supported_content)
@@ -503,10 +520,12 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
         db_connection,
         create_tables=False,
         upsert_batch_size=DEFAULT_UPSERT_BATCH_SIZE,
+        only_keep_latest_version=False,
         **engine_parameters,
     ):
         super().__init__(db_connection, create_tables, **engine_parameters)
         self.upsert_batch_size = max(1, int(upsert_batch_size))
+        self.only_keep_latest_version = bool(only_keep_latest_version)
 
     @staticmethod
     def get_next_param(kwargs: Dict) -> str:
@@ -1009,6 +1028,15 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
             stix_exclude_keys = ("id", "type", "spec_version")
             for obj in objects:
                 version = get_object_version(obj)
+                log.debug(
+                    "taxii2.add_objects.prepare",
+                    api_root_id=str(api_root_id),
+                    collection_id=str(collection_id),
+                    stix_id=obj["id"],
+                    stix_type=obj.get("type"),
+                    spec_version=obj.get("spec_version"),
+                    version=version.isoformat(),
+                )
                 stix_rows.append(
                     {
                         "id": obj["id"],
@@ -1039,11 +1067,52 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
             if stix_rows:
                 for start in range(0, len(stix_rows), self.upsert_batch_size):
                     batch = stix_rows[start : start + self.upsert_batch_size]
+                    log.debug(
+                        "taxii2.add_objects.batch_insert",
+                        api_root_id=str(api_root_id),
+                        collection_id=str(collection_id),
+                        start_index=start,
+                        batch_size=len(batch),
+                    )
                     insert_stmt = pg_insert(taxii2models.STIXObject).values(batch)
                     insert_stmt = insert_stmt.on_conflict_do_nothing(
                         index_elements=["id", "collection_id", "version"]
                     )
                     self.db.session.execute(insert_stmt)
+
+                if self.only_keep_latest_version:
+                    log.debug(
+                        "taxii2.add_objects.prune_latest_only.start",
+                        api_root_id=str(api_root_id),
+                        collection_id=str(collection_id),
+                        object_count=len(stix_rows),
+                    )
+                    object_versions = {}
+                    for row in stix_rows:
+                        key = (row["collection_id"], row["id"])
+                        current_version = object_versions.get(key)
+                        if current_version is None or row["version"] > current_version:
+                            object_versions[key] = row["version"]
+
+                    for (target_collection_id, object_id), latest_version in (
+                        object_versions.items()
+                    ):
+                        log.debug(
+                            "taxii2.add_objects.prune_latest_only.object",
+                            collection_id=str(target_collection_id),
+                            stix_id=object_id,
+                            kept_version=latest_version.isoformat(),
+                        )
+                        (
+                            self.db.session.query(taxii2models.STIXObject)
+                            .filter(
+                                taxii2models.STIXObject.collection_id
+                                == target_collection_id,
+                                taxii2models.STIXObject.id == object_id,
+                                taxii2models.STIXObject.version != latest_version,
+                            )
+                            .delete("fetch")
+                        )
 
             completed_timestamp = now
             self.db.session.query(taxii2models.Job).filter(
