@@ -387,6 +387,23 @@ class OpenTAXII2PersistenceAPI:
     ) -> None:
         raise NotImplementedError
 
+    def delete_objects(
+        self,
+        collection_id: uuid.UUID,
+        object_ids: List[str],
+        match_version: Optional[List[str]] = None,
+        match_spec_version: Optional[List[str]] = None,
+    ) -> int:
+        """Delete several objects, with a portable fallback for custom APIs."""
+        for object_id in dict.fromkeys(object_ids):
+            self.delete_object(
+                collection_id=collection_id,
+                object_id=object_id,
+                match_version=match_version,
+                match_spec_version=match_spec_version,
+            )
+        return len(set(object_ids))
+
     def get_versions(
         self,
         collection_id: uuid.UUID,

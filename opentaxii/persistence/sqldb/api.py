@@ -1,5 +1,6 @@
 import base64
 import datetime
+import hashlib
 import json
 import uuid
 from functools import reduce
@@ -8,8 +9,10 @@ from typing import Dict, List, Optional, Tuple, no_type_check
 import six
 import sqlalchemy
 import structlog
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import and_, func, literal, or_
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Query, aliased, load_only
 
 from opentaxii.common.sqldb import BaseSQLDatabaseAPI
@@ -35,6 +38,7 @@ log = structlog.getLogger(__name__)
 
 YIELD_PER_SIZE = 100
 DEFAULT_UPSERT_BATCH_SIZE = 1000
+DEFAULT_DELETE_BATCH_SIZE = 400
 
 
 class SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXIIPersistenceAPI):
@@ -57,16 +61,27 @@ class SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXIIPersistenceAPI):
 
     BASEMODEL = Base
 
+    def _read(self, callback):
+        try:
+            return callback()
+        finally:
+            self.db.session.remove()
+
     def get_services(self, collection_id=None):
-        if collection_id:
-            collection = self.db.session.query(DataCollection).get(collection_id)
-            services = collection.services
-        else:
-            services = self.db.session.query(Service).all()
-        return [conv.to_service_entity(s) for s in services]
+        def _callback():
+            if collection_id:
+                collection = self.db.session.query(DataCollection).get(collection_id)
+                services = collection.services
+            else:
+                services = self.db.session.query(Service).all()
+            return [conv.to_service_entity(s) for s in services]
+
+        return self._read(_callback)
 
     def get_service(self, service_id):
-        return conv.to_service_entity(self.db.session.query(Service).get(service_id))
+        return self._read(
+            lambda: conv.to_service_entity(self.db.session.query(Service).get(service_id))
+        )
 
     def update_service(self, obj):
         service = self.db.session.query(Service).get(obj.id) if obj.id else None
@@ -85,30 +100,36 @@ class SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXIIPersistenceAPI):
         return self.update_service(entity)
 
     def get_collections(self, service_id=None):
-        if service_id:
-            service = self.db.session.query(Service).get(service_id)
-            collections = service.collections
-        else:
-            collections = self.db.session.query(DataCollection).all()
-        return [conv.to_collection_entity(c) for c in collections]
+        def _callback():
+            if service_id:
+                service = self.db.session.query(Service).get(service_id)
+                collections = service.collections
+            else:
+                collections = self.db.session.query(DataCollection).all()
+            return [conv.to_collection_entity(c) for c in collections]
+
+        return self._read(_callback)
 
     def get_collection(self, name, service_id=None):
-        if service_id:
-            collection = (
-                self.db.session.query(DataCollection)
-                .join(Service.collections)
-                .filter(Service.id == service_id)
-                .filter(DataCollection.name == name)
-                .one_or_none()
-            )
-        else:
-            collection = (
-                self.db.session.query(DataCollection)
-                .filter(DataCollection.name == name)
-                .one_or_none()
-            )
-        if collection:
-            return conv.to_collection_entity(collection)
+        def _callback():
+            if service_id:
+                collection = (
+                    self.db.session.query(DataCollection)
+                    .join(Service.collections)
+                    .filter(Service.id == service_id)
+                    .filter(DataCollection.name == name)
+                    .one_or_none()
+                )
+            else:
+                collection = (
+                    self.db.session.query(DataCollection)
+                    .filter(DataCollection.name == name)
+                    .one_or_none()
+                )
+            if collection:
+                return conv.to_collection_entity(collection)
+
+        return self._read(_callback)
 
     def update_collection(self, entity):
         _bindings = conv.serialize_content_bindings(entity.supported_content)
@@ -503,10 +524,196 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
         db_connection,
         create_tables=False,
         upsert_batch_size=DEFAULT_UPSERT_BATCH_SIZE,
+        delete_batch_size=DEFAULT_DELETE_BATCH_SIZE,
+        only_keep_latest_version=False,
+        verify_indexes=True,
+        require_indexes=False,
         **engine_parameters,
     ):
         super().__init__(db_connection, create_tables, **engine_parameters)
         self.upsert_batch_size = max(1, int(upsert_batch_size))
+        self.delete_batch_size = max(1, int(delete_batch_size))
+        self.only_keep_latest_version = bool(only_keep_latest_version)
+        if verify_indexes:
+            self._verify_required_indexes(require_indexes=bool(require_indexes))
+
+    def _verify_required_indexes(self, require_indexes: bool = False) -> None:
+        """Check indexes required by pagination, latest-version reads and upserts."""
+        inspector = sqlalchemy.inspect(self.db.engine)
+        table_name = taxii2models.STIXObject.__tablename__
+        available = {
+            tuple(index.get("column_names") or ())
+            for index in inspector.get_indexes(table_name)
+        }
+        available.update(
+            tuple(constraint.get("column_names") or ())
+            for constraint in inspector.get_unique_constraints(table_name)
+        )
+        required = {
+            ("collection_id", "date_added", "id"),
+            ("collection_id", "id", "version"),
+        }
+        missing = sorted(required - available)
+        if not missing:
+            log.info("taxii2.database.indexes_verified", table=table_name)
+            return
+        log.error(
+            "taxii2.database.indexes_missing",
+            table=table_name,
+            missing=[list(columns) for columns in missing],
+        )
+        if require_indexes:
+            raise RuntimeError(
+                f"Missing required indexes on {table_name}: "
+                + ", ".join("(" + ", ".join(columns) + ")" for columns in missing)
+            )
+
+    @staticmethod
+    def _advisory_lock_key(collection_id: uuid.UUID, object_id: str) -> int:
+        value = f"{collection_id}:{object_id}".encode("utf-8")
+        digest = hashlib.blake2b(value, digest_size=8).digest()
+        return int.from_bytes(digest, "big", signed=True)
+
+    def _lock_objects(self, collection_id: uuid.UUID, object_ids: List[str]) -> None:
+        """Serialize overlapping writes while preserving PostgreSQL concurrency."""
+        object_ids = sorted(set(object_ids))
+        if not object_ids:
+            return
+        if self.db.engine.dialect.name == "postgresql":
+            lock_keys = sorted(
+                self._advisory_lock_key(collection_id, object_id)
+                for object_id in object_ids
+            )
+            for start in range(0, len(lock_keys), self.delete_batch_size):
+                batch = lock_keys[start : start + self.delete_batch_size]
+                locks = sqlalchemy.values(
+                    sqlalchemy.column("lock_key", sqlalchemy.BigInteger), name="locks"
+                ).data([(key,) for key in batch])
+                statement = (
+                    sqlalchemy.select(func.pg_advisory_xact_lock(locks.c.lock_key))
+                    .select_from(locks)
+                    .order_by(locks.c.lock_key)
+                )
+                self.db.session.execute(statement).all()
+            return
+
+        # MySQL and other backends get a portable collection-level lock. SQLite
+        # ignores FOR UPDATE but serializes writers itself.
+        (
+            self.db.session.query(taxii2models.Collection.id)
+            .filter(taxii2models.Collection.id == collection_id)
+            .with_for_update()
+            .one()
+        )
+
+    def _insert_stix_rows(self, rows: List[Dict]) -> None:
+        """Insert object rows idempotently using the best available dialect path."""
+        if not rows:
+            return
+        table = taxii2models.STIXObject.__table__
+        dialect = self.db.engine.dialect.name
+        if dialect == "postgresql":
+            statement = pg_insert(table).values(rows).on_conflict_do_nothing(
+                index_elements=["id", "collection_id", "version"]
+            )
+            self.db.session.execute(statement)
+            return
+        if dialect == "sqlite":
+            statement = sqlite_insert(table).values(rows).on_conflict_do_nothing(
+                index_elements=["id", "collection_id", "version"]
+            )
+            self.db.session.execute(statement)
+            return
+        if dialect in ("mysql", "mariadb"):
+            statement = mysql_insert(table).values(rows)
+            statement = statement.on_duplicate_key_update(id=statement.inserted.id)
+            self.db.session.execute(statement)
+            return
+
+        # Portable fallback. The write lock prevents another application worker
+        # from inserting the same keys between this lookup and the insert.
+        collection_id = rows[0]["collection_id"]
+        ids = sorted({row["id"] for row in rows})
+        existing = {
+            (object_id, version)
+            for object_id, version in (
+                self.db.session.query(
+                    taxii2models.STIXObject.id,
+                    taxii2models.STIXObject.version,
+                )
+                .filter(
+                    taxii2models.STIXObject.collection_id == collection_id,
+                    taxii2models.STIXObject.id.in_(ids),
+                )
+                .all()
+            )
+        }
+        missing_by_key = {}
+        for row in rows:
+            key = (row["id"], row["version"])
+            if key not in existing:
+                missing_by_key.setdefault(key, row)
+        missing = list(missing_by_key.values())
+        if missing:
+            self.db.session.execute(table.insert(), missing)
+
+    def _prune_old_versions(
+        self, collection_id: uuid.UUID, object_ids: List[str]
+    ) -> int:
+        """Delete all but the database-wide newest version in set-based batches."""
+        deleted = 0
+        object_ids = sorted(set(object_ids))
+        table = taxii2models.STIXObject.__table__
+        for start in range(0, len(object_ids), self.delete_batch_size):
+            batch = object_ids[start : start + self.delete_batch_size]
+            if self.db.engine.dialect.name == "postgresql":
+                candidate = table.alias("latest_stix")
+                latest_version = (
+                    sqlalchemy.select(func.max(candidate.c.version))
+                    .where(
+                        candidate.c.collection_id == table.c.collection_id,
+                        candidate.c.id == table.c.id,
+                    )
+                    .scalar_subquery()
+                )
+                statement = table.delete().where(
+                    table.c.collection_id == collection_id,
+                    table.c.id.in_(batch),
+                    table.c.version < latest_version,
+                )
+                result = self.db.session.execute(statement)
+                deleted += max(0, result.rowcount or 0)
+                continue
+
+            latest_versions = (
+                self.db.session.query(
+                    taxii2models.STIXObject.id,
+                    func.max(taxii2models.STIXObject.version),
+                )
+                .filter(
+                    taxii2models.STIXObject.collection_id == collection_id,
+                    taxii2models.STIXObject.id.in_(batch),
+                )
+                .group_by(taxii2models.STIXObject.id)
+                .all()
+            )
+            older = [
+                and_(
+                    taxii2models.STIXObject.id == object_id,
+                    taxii2models.STIXObject.version < latest_version,
+                )
+                for object_id, latest_version in latest_versions
+            ]
+            if older:
+                deleted += (
+                    self.db.session.query(taxii2models.STIXObject)
+                    .filter(
+                        taxii2models.STIXObject.collection_id == collection_id,
+                        or_(*older),
+                    )
+                    .delete(synchronize_session=False)
+                )
+        return deleted
 
     @staticmethod
     def get_next_param(kwargs: Dict) -> str:
@@ -870,11 +1077,17 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
         self, query: Query, limit: Optional[int] = None
     ) -> Tuple[Query, bool]:
         if limit is not None:
-            more = limit < query.limit(limit + 1).count()
-            query = query.limit(limit)
-        else:
-            more = False
-        return query, more
+            query = query.limit(limit + 1)
+        return query, False
+
+    @staticmethod
+    def _materialize_page(query: Query, limit: Optional[int]) -> Tuple[List, bool]:
+        """Fetch one look-ahead row instead of issuing a separate count query."""
+        items = query.all()
+        more = limit is not None and len(items) > limit
+        if more:
+            items = items[:limit]
+        return items, more
 
     def _filtered_objects_query(
         self,
@@ -927,6 +1140,7 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
                 taxii2models.STIXObject.spec_version,
             )
         )
+        items, more = self._materialize_page(query, limit)
         return (
             [
                 entities.ManifestRecord(
@@ -935,7 +1149,7 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
                     version=obj.version,
                     spec_version=obj.spec_version,
                 )
-                for obj in query.all()
+                for obj in items
             ],
             more,
         )
@@ -961,7 +1175,7 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
             match_version=match_version,
             match_spec_version=match_spec_version,
         )
-        items = query.all()
+        items, more = self._materialize_page(query, limit)
         if more:
             next_param = self.get_next_param(
                 {"id": items[-1].id, "date_added": items[-1].date_added}
@@ -989,11 +1203,11 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
         self, api_root_id: uuid.UUID, collection_id: uuid.UUID, objects: List[Dict]
     ) -> entities.Job:
         def _work():
-            now = datetime.datetime.now(datetime.timezone.utc)
+            request_timestamp = datetime.datetime.now(datetime.timezone.utc)
             job = taxii2models.Job(
                 api_root_id=api_root_id,
                 status="pending",
-                request_timestamp=now,
+                request_timestamp=request_timestamp,
                 completed_timestamp=None,
                 total_count=0,
                 success_count=0,
@@ -1002,9 +1216,8 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
             )
             self.db.session.add(job)
             self.db.session.flush()
-            total_count = 0
-            success_count = 0
             job_details = []
+            job_detail_rows = []
             stix_rows = []
             stix_exclude_keys = ("id", "type", "spec_version")
             for obj in objects:
@@ -1015,7 +1228,7 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
                         "collection_id": collection_id,
                         "type": obj["id"].split("--")[0],
                         "spec_version": obj["spec_version"],
-                        "date_added": now,
+                        "date_added": request_timestamp,
                         "version": version,
                         "serialized_data": {
                             key: value
@@ -1024,28 +1237,46 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
                         },
                     }
                 )
-                job_detail = taxii2models.JobDetail(
-                    job_id=job.id,
-                    stix_id=obj["id"],
-                    version=version,
-                    message="",
-                    status="success",
-                )
-                job_details.append(job_detail)
-                self.db.session.add(job_detail)
-                total_count += 1
-                success_count += 1
+                job_detail_row = {
+                    "id": uuid.uuid4(),
+                    "job_id": job.id,
+                    "stix_id": obj["id"],
+                    "version": version,
+                    "message": "",
+                    "status": "success",
+                }
+                job_detail_rows.append(job_detail_row)
+                job_details.append(taxii2models.JobDetail(**job_detail_row))
 
             if stix_rows:
+                object_ids = [row["id"] for row in stix_rows]
+                self._lock_objects(collection_id, object_ids)
+                stix_rows.sort(key=lambda row: (row["id"], row["version"]))
                 for start in range(0, len(stix_rows), self.upsert_batch_size):
                     batch = stix_rows[start : start + self.upsert_batch_size]
-                    insert_stmt = pg_insert(taxii2models.STIXObject).values(batch)
-                    insert_stmt = insert_stmt.on_conflict_do_nothing(
-                        index_elements=["id", "collection_id", "version"]
-                    )
-                    self.db.session.execute(insert_stmt)
+                    self._insert_stix_rows(batch)
 
-            completed_timestamp = now
+                if self.only_keep_latest_version:
+                    deleted_versions = self._prune_old_versions(
+                        collection_id, object_ids
+                    )
+                    log.info(
+                        "taxii2.add_objects.prune_latest_only",
+                        api_root_id=str(api_root_id),
+                        collection_id=str(collection_id),
+                        object_count=len(set(object_ids)),
+                        deleted_versions=deleted_versions,
+                    )
+
+            for start in range(0, len(job_detail_rows), self.upsert_batch_size):
+                self.db.session.execute(
+                    taxii2models.JobDetail.__table__.insert(),
+                    job_detail_rows[start : start + self.upsert_batch_size],
+                )
+
+            total_count = len(objects)
+            success_count = total_count
+            completed_timestamp = datetime.datetime.now(datetime.timezone.utc)
             self.db.session.query(taxii2models.Job).filter(
                 taxii2models.Job.id == job.id
             ).update(
@@ -1108,7 +1339,7 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
             match_version=match_version,
             match_spec_version=match_spec_version,
         )
-        items = query.all()
+        items, more = self._materialize_page(query, limit)
         if more:
             next_param = self.get_next_param(
                 {"id": items[-1].id, "date_added": items[-1].date_added}
@@ -1139,17 +1370,40 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
         match_version: Optional[List[str]] = None,
         match_spec_version: Optional[List[str]] = None,
     ) -> None:
-        if match_version is None:
-            match_version = ["all"]
-        query, _ = self._filtered_objects_query(
+        self.delete_objects(
             collection_id=collection_id,
-            match_id=[object_id],
+            object_ids=[object_id],
             match_version=match_version,
             match_spec_version=match_spec_version,
-            ordered=False,
         )
-        query.delete("fetch")
-        self._commit_with_retry()
+
+    def delete_objects(
+        self,
+        collection_id: uuid.UUID,
+        object_ids: List[str],
+        match_version: Optional[List[str]] = None,
+        match_spec_version: Optional[List[str]] = None,
+    ) -> int:
+        if match_version is None:
+            match_version = ["all"]
+        unique_ids = sorted(set(object_ids))
+
+        def _work():
+            self._lock_objects(collection_id, unique_ids)
+            deleted = 0
+            for start in range(0, len(unique_ids), self.delete_batch_size):
+                batch = unique_ids[start : start + self.delete_batch_size]
+                query, _ = self._filtered_objects_query(
+                    collection_id=collection_id,
+                    match_id=batch,
+                    match_version=match_version,
+                    match_spec_version=match_spec_version,
+                    ordered=False,
+                )
+                deleted += query.delete(synchronize_session=False)
+            return deleted
+
+        return self._run_with_retry(_work)
 
     def get_versions(
         self,
@@ -1193,13 +1447,14 @@ class Taxii2SQLDatabaseAPI(BaseSQLDatabaseAPI, OpenTAXII2PersistenceAPI):
                 taxii2models.STIXObject.version,
             )
         )
+        items, more = self._materialize_page(query, limit)
         return (
             [
                 entities.VersionRecord(
                     date_added=obj.date_added,
                     version=obj.version,
                 )
-                for obj in query.all()
+                for obj in items
             ],
             more,
         )
