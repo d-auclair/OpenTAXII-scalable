@@ -56,7 +56,8 @@ class BaseSQLDatabaseAPI:
             except OperationalError as error:
                 self.db.session.rollback()
                 attempts += 1
-                if not self._is_retryable(error) or attempts >= max_attempts:
+                pgcode = str(getattr(error.orig, "pgcode", "") or "")
+                if pgcode not in ("40001", "40P01") or attempts >= max_attempts:
                     raise
                 time.sleep(base_delay * attempts)
             except Exception:
@@ -75,7 +76,8 @@ class BaseSQLDatabaseAPI:
             except OperationalError as error:
                 self.db.session.rollback()
                 attempts += 1
-                if not self._is_retryable(error) or attempts >= max_attempts:
+                pgcode = str(getattr(error.orig, "pgcode", "") or "")
+                if pgcode not in ("40001", "40P01") or attempts >= max_attempts:
                     raise
                 time.sleep(base_delay * attempts)
             except Exception:
