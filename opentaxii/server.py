@@ -30,6 +30,7 @@ from opentaxii.persistence.exceptions import (
 )
 from opentaxii.taxii2.utils import taxii2_datetimeformat
 from opentaxii.taxii2.validation import (
+    validate_delete_envelope,
     validate_delete_filter_params,
     validate_envelope,
     validate_list_filter_params,
@@ -436,9 +437,17 @@ class TAXII2Server(BaseTAXIIServer):
 
     def __init__(self, config: dict):
         self.config = config
-        self.persistence = Taxii2PersistenceManager(
-            server=self, api=initialize_api(config["persistence_api"])
-        )
+        api_config = config["persistence_api"]
+        api = initialize_api(api_config)
+        api_parameters = api_config.get("parameters") or {}
+        if (
+            "only_keep_latest_version" not in api_parameters
+            and hasattr(api, "only_keep_latest_version")
+        ):
+            api.only_keep_latest_version = bool(
+                config.get("only_keep_latest_version", False)
+            )
+        self.persistence = Taxii2PersistenceManager(server=self, api=api)
         self.setup_endpoint_mapping()
 
     def handle_http_exception(self, error):
@@ -511,9 +520,9 @@ class TAXII2Server(BaseTAXIIServer):
             ]
         ):
             raise NotAcceptable()
-        if (
-            request.method == "POST"
-            and request.content_type not in endpoint.func.registered_valid_content_types
+        has_delete_body = request.method == "DELETE" and bool(request.data)
+        if (request.method == "POST" or has_delete_body) and (
+            request.content_type not in endpoint.func.registered_valid_content_types
         ):
             raise UnsupportedMediaType()
 
@@ -701,7 +710,7 @@ class TAXII2Server(BaseTAXIIServer):
     @register_handler(
         r"^/taxii2/(?P<api_root_id>[^/]+)"
         r"/collections/(?P<collection_id_or_alias>[^/]+)/objects/$",
-        ("GET", "POST"),
+        ("GET", "POST", "DELETE"),
         valid_content_types=("application/taxii+json;version=2.1",),
         handles_own_auth=True,
     )
@@ -711,6 +720,10 @@ class TAXII2Server(BaseTAXIIServer):
             return self.objects_get_handler(api_root_uuid, collection_id_or_alias)
         if request.method == "POST":
             return self.objects_post_handler(api_root_uuid, collection_id_or_alias)
+        if request.method == "DELETE":
+            if not request.data:
+                raise MethodNotAllowed(valid_methods=("GET", "POST"))
+            return self.objects_delete_handler(api_root_uuid, collection_id_or_alias)
 
     def objects_get_handler(self, api_root_id: uuid.UUID, collection_id_or_alias: str):
         filter_params = validate_list_filter_params(request.args, self.persistence.api)
@@ -756,27 +769,10 @@ class TAXII2Server(BaseTAXIIServer):
         )
 
     def objects_post_handler(self, api_root_id: uuid.UUID, collection_id_or_alias: str):
-        log.debug(
-            "taxii2.objects.post.request",
-            path=request.path,
-            api_root_id=str(api_root_id),
-            collection_id_or_alias=collection_id_or_alias,
-            content_length=request.content_length,
-        )
         try:
             parsed_data = request.get_json()
-            object_count = (
-                len(parsed_data.get("objects", [])) if isinstance(parsed_data, dict) else 0
-            )
-            log.debug(
-                "taxii2.objects.post.payload",
-                path=request.path,
-                api_root_id=str(api_root_id),
-                collection_id_or_alias=collection_id_or_alias,
-                object_count=object_count,
-            )
             validate_envelope(
-                request.data,
+                parsed_data,
                 allow_custom=self.config.get("allow_custom_properties", True),
             )
         except Exception as error:
@@ -805,6 +801,28 @@ class TAXII2Server(BaseTAXIIServer):
             202,
             extra_headers=headers,
         )
+
+    def objects_delete_handler(
+        self, api_root_id: uuid.UUID, collection_id_or_alias: str
+    ):
+        object_ids = validate_delete_envelope(request.get_json())
+        filter_params = validate_delete_filter_params(request.args)
+        try:
+            deleted = self.persistence.delete_objects(
+                api_root_id=api_root_id,
+                collection_id_or_alias=collection_id_or_alias,
+                object_ids=object_ids,
+                **filter_params,
+            )
+        except (DoesNotExistError, NoReadNoWritePermission):
+            if context.account is None:
+                raise Unauthorized()
+            raise NotFound()
+        except (NoReadPermission, NoWritePermission):
+            if context.account is None:
+                raise Unauthorized()
+            raise Forbidden()
+        return make_taxii2_response({"deleted": deleted})
 
     @register_handler(
         r"^/taxii2/(?P<api_root_id>[^/]+)"

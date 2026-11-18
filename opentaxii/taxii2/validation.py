@@ -2,10 +2,10 @@
 
 import datetime
 import json
-from typing import Mapping, Union
+from typing import List, Mapping, Union
 
 import structlog
-from marshmallow import Schema, fields
+from marshmallow import Schema, fields, validate
 from stix2 import parse
 from stix2.exceptions import STIXError
 
@@ -16,7 +16,9 @@ from opentaxii.taxii2.utils import DATETIMEFORMAT
 log = structlog.get_logger(__name__)
 
 
-def validate_envelope(json_data: Union[str, bytes], allow_custom: bool = False) -> None:
+def validate_envelope(
+    json_data: Union[str, bytes, Mapping], allow_custom: bool = False
+) -> None:
     """
     Validate if ``json_data`` is a valid taxii2 envelope.
 
@@ -25,19 +27,16 @@ def validate_envelope(json_data: Union[str, bytes], allow_custom: bool = False) 
     """
     if not json_data:
         raise ValidationError("No data")
-    try:
-        data = json.loads(json_data)
-    except json.JSONDecodeError as e:
-        raise ValidationError(f"Invalid json: {str(e)}") from e
+    if isinstance(json_data, Mapping):
+        data = json_data
+    else:
+        try:
+            data = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            raise ValidationError(f"Invalid json: {str(e)}") from e
     if "objects" not in data:
         raise ValidationError("No objects")
     for index, item in enumerate(data["objects"]):
-        log.debug(
-            "taxii2.envelope.object.validate",
-            index=index,
-            stix_id=item.get("id"),
-            stix_type=item.get("type"),
-        )
         try:
             parse(item, allow_custom)
         except STIXError as e:
@@ -51,6 +50,18 @@ def validate_envelope(json_data: Union[str, bytes], allow_custom: bool = False) 
             raise ValidationError(
                 f"Invalid stix object: {json.dumps(item)}; {str(e)}"
             ) from e
+
+
+def validate_delete_envelope(data: Mapping) -> List[str]:
+    """Validate the OpenTAXII bulk-delete extension payload."""
+    if not isinstance(data, Mapping):
+        raise ValidationError("Bulk delete payload must be a JSON object")
+    object_ids = data.get("object_ids")
+    if not isinstance(object_ids, list) or not object_ids:
+        raise ValidationError("object_ids must be a non-empty list")
+    if any(not isinstance(object_id, str) or not object_id for object_id in object_ids):
+        raise ValidationError("Each object_ids entry must be a non-empty string")
+    return list(dict.fromkeys(object_ids))
 
 
 class Taxii2DateTime(fields.DateTime):
@@ -116,7 +127,7 @@ class PersistenceApiMxin:
 class VersionFilterParamsSchema(PersistenceApiMxin, Schema):
     """Schema for the versions endpoint filters."""
 
-    limit = fields.Int()
+    limit = fields.Int(validate=validate.Range(min=1))
     added_after = Taxii2DateTime()
     next_kwargs = Taxii2Next(data_key="next")
     match_spec_version = Taxii2Filter(data_key="match[spec_version]")
@@ -125,7 +136,7 @@ class VersionFilterParamsSchema(PersistenceApiMxin, Schema):
 class ObjectFilterParamsSchema(PersistenceApiMxin, Schema):
     """Schema for the object endpoint filters."""
 
-    limit = fields.Int()
+    limit = fields.Int(validate=validate.Range(min=1))
     added_after = Taxii2DateTime()
     next_kwargs = Taxii2Next(data_key="next")
     match_spec_version = Taxii2Filter(data_key="match[spec_version]")
@@ -135,7 +146,7 @@ class ObjectFilterParamsSchema(PersistenceApiMxin, Schema):
 class ListFilterParamsSchema(PersistenceApiMxin, Schema):
     """Schema for the object list endpoint filters."""
 
-    limit = fields.Int()
+    limit = fields.Int(validate=validate.Range(min=1))
     added_after = Taxii2DateTime()
     next_kwargs = Taxii2Next(data_key="next")
     match_spec_version = Taxii2Filter(data_key="match[spec_version]")

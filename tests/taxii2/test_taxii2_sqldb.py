@@ -981,6 +981,12 @@ def test_add_objects_only_keep_latest_version(taxii2_sqldb_api: Taxii2SQLDatabas
         collection_id=COLLECTIONS[5].id,
         objects=[newer_object],
     )
+    # Replaying an older version must not replace the database-wide latest one.
+    taxii2_sqldb_api.add_objects(
+        api_root_id=API_ROOTS[0].id,
+        collection_id=COLLECTIONS[5].id,
+        objects=[older_object],
+    )
 
     db_objects = (
         taxii2_sqldb_api.db.session.query(STIXObject)
@@ -1342,6 +1348,21 @@ def test_delete_object(
         (db_obj.collection_id, db_obj.id, db_obj.version)
         for db_obj in taxii2_sqldb_api.db.session.query(STIXObject).all()
     ) == set((obj.collection_id, obj.id, obj.version) for obj in expected_objects)
+
+
+def test_delete_objects_in_batch(taxii2_sqldb_api, db_stix_objects):
+    deleted = taxii2_sqldb_api.delete_objects(
+        collection_id=COLLECTIONS[5].id,
+        object_ids=[STIX_OBJECTS[0].id, STIX_OBJECTS[1].id, STIX_OBJECTS[0].id],
+    )
+
+    assert deleted == 3
+    assert (
+        taxii2_sqldb_api.db.session.query(STIXObject)
+        .filter(STIXObject.collection_id == COLLECTIONS[5].id)
+        .count()
+        == 0
+    )
 
 
 @pytest.mark.parametrize(

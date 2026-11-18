@@ -585,6 +585,32 @@ class Taxii2PersistenceManager:
             match_spec_version=match_spec_version,
         )
 
+    def delete_objects(
+        self,
+        api_root_id: uuid.UUID,
+        collection_id_or_alias: str,
+        object_ids: List[str],
+        match_version: Optional[List[str]] = None,
+        match_spec_version: Optional[List[str]] = None,
+    ) -> int:
+        collection = self.get_collection(
+            api_root_id=api_root_id, collection_id_or_alias=collection_id_or_alias
+        )
+        if not collection.can_read(context.account) and not collection.can_write(
+            context.account
+        ):
+            raise NoReadNoWritePermission
+        if not collection.can_read(context.account):
+            raise NoReadPermission
+        if not collection.can_write(context.account):
+            raise NoWritePermission
+        return self.api.delete_objects(
+            collection_id=collection.id,
+            object_ids=object_ids,
+            match_version=match_version,
+            match_spec_version=match_spec_version,
+        )
+
     def get_versions(
         self,
         api_root_id: uuid.UUID,

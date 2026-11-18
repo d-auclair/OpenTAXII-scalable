@@ -1256,6 +1256,45 @@ def test_objects(
         assert content == expected_content
 
 
+def test_bulk_delete_objects(authenticated_client):
+    object_ids = [STIX_OBJECTS[0].id, STIX_OBJECTS[1].id]
+    taxii2_server = authenticated_client.application.taxii_server.servers.taxii2
+    with (
+        patch.object(
+            taxii2_server.persistence.api,
+            "get_collection",
+            side_effect=GET_COLLECTION_MOCK,
+        ),
+        patch.object(
+            authenticated_client.account,
+            "permissions",
+            {str(COLLECTIONS[5].id): ["write", "read"]},
+        ),
+        patch.object(
+            taxii2_server.persistence.api,
+            "delete_objects",
+            return_value=2,
+        ) as delete_objects_mock,
+    ):
+        response = authenticated_client.delete(
+            f"/taxii2/{API_ROOTS[0].id}/collections/{COLLECTIONS[5].id}/objects/",
+            data=json.dumps({"object_ids": object_ids}),
+            headers={
+                "Accept": "application/taxii+json;version=2.1",
+                "Content-Type": "application/taxii+json;version=2.1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert json.loads(response.data) == {"deleted": 2}
+    delete_objects_mock.assert_called_once_with(
+        collection_id=COLLECTIONS[5].id,
+        object_ids=object_ids,
+        match_version=None,
+        match_spec_version=None,
+    )
+
+
 @pytest.mark.parametrize("is_public", [True, False])
 @pytest.mark.parametrize("is_public_write", [True, False])
 @pytest.mark.parametrize("method", ["get", "post", "delete"])
