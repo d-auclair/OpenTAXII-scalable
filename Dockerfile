@@ -2,7 +2,7 @@ FROM python:3-slim AS build
 LABEL maintainer="EclecticIQ <opentaxii@eclecticiq.com>"
 
 RUN apt-get update \
- && apt-get install -y libmariadb-dev-compat
+ && apt-get install -y pkg-config libmariadb-dev-compat
 
 RUN python3 -m venv /venv && /venv/bin/pip install -U pip setuptools
 
